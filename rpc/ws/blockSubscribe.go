@@ -85,7 +85,8 @@ func (c *Client) BlockSubscribe(
 	filter BlockSubscribeFilter,
 	opts *BlockSubscribeOpts,
 ) (*BlockSubscription, error) {
-	var params []interface{}
+	var params []any
+
 	if filter != nil {
 		switch v := filter.(type) {
 		case BlockSubscribeFilterAll:
@@ -94,6 +95,7 @@ func (c *Client) BlockSubscribe(
 			params = append(params, rpc.M{"mentionsAccountOrProgram": v.Pubkey})
 		}
 	}
+
 	if opts != nil {
 		obj := make(rpc.M)
 		if opts.Commitment != "" {
@@ -104,10 +106,12 @@ func (c *Client) BlockSubscribe(
 				opts.Encoding,
 				// Valid encodings:
 				// solana.EncodingJSON, // TODO
-				solana.EncodingJSONParsed, // TODO
+				// solana.EncodingJSONParsed, // TODO
 				solana.EncodingBase58,
 				solana.EncodingBase64,
 				solana.EncodingBase64Zstd,
+				solana.EncodingJSONParsed,
+				solana.EncodingJSON,
 			) {
 				return nil, fmt.Errorf("provided encoding is not supported: %s", opts.Encoding)
 			}
@@ -119,13 +123,13 @@ func (c *Client) BlockSubscribe(
 		if opts.Rewards != nil {
 			obj["rewards"] = opts.Rewards
 		}
-		if opts.MaxSupportedTransactionVersion != nil {
-			obj["maxSupportedTransactionVersion"] = *opts.MaxSupportedTransactionVersion
-		}
+		obj["maxSupportedTransactionVersion"] = 0
+		// obj["transactionDetails"] = "full"
 		if len(obj) > 0 {
 			params = append(params, obj)
 		}
 	}
+
 	genSub, err := c.subscribe(
 		params,
 		nil,
@@ -140,6 +144,7 @@ func (c *Client) BlockSubscribe(
 	if err != nil {
 		return nil, err
 	}
+
 	return &BlockSubscription{
 		sub: genSub,
 	}, nil
