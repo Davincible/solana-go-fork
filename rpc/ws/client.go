@@ -18,24 +18,58 @@
 package ws
 
 import (
+	"bytes"
 	"context"
+	jjson "encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/buger/jsonparser"
-	"github.com/gorilla/rpc/v2/json2"
+	"github.com/Davincible/d-utils/safemap"
+	"github.com/bytedance/sonic"
 	"github.com/gorilla/websocket"
-	"go.uber.org/zap"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/valyala/bytebufferpool"
+	"golang.org/x/exp/slog"
+
+	"github.com/gagliardetto/solana-go/utils/completion"
+)
+
+var (
+	bufferPool = bytebufferpool.Pool{}
+	jsonn      = jsoniter.ConfigCompatibleWithStandardLibrary
+
+	// Configure Sonic for fastest performance
+	sonicAPI = sonic.ConfigFastest
+
+	// Pool for message type structs
+	messageTypePool = sync.Pool{
+		New: func() any {
+			return &resp{}
+		},
+	}
+
+	// Pool for raw message buffers
+	rawMessagePool = sync.Pool{
+		New: func() any {
+			return bytes.NewBuffer(make([]byte, 0, 10*1024*1024)) // 10MB initial capacity
+		},
+	}
 )
 
 var ErrSubscriptionClosed = errors.New("subscription closed")
 
-type result interface{}
+type result any
+
+type messageTask struct {
+	buf *bytes.Buffer
+}
 
 type Client struct {
 	rpcURL                  string
@@ -43,10 +77,16 @@ type Client struct {
 	connCtx                 context.Context
 	connCtxCancel           context.CancelFunc
 	lock                    sync.RWMutex
-	subscriptionByRequestID map[uint64]*Subscription
-	subscriptionByWSSubID   map[uint64]*Subscription
+	subscriptionByRequestID safemap.Map[*Subscription]
+	subscriptionByWSSubID   safemap.Map[*Subscription]
 	reconnectOnErr          bool
 	shortID                 bool
+
+	pong *completion.Completer
+
+	// Worker pool
+	workerCount int
+	taskChan    chan messageTask
 }
 
 const (
@@ -56,28 +96,37 @@ const (
 	pongWait = 60 * time.Second
 	// Send pings to peer with this period. Must be less than pongWait.
 	pingPeriod = (pongWait * 9) / 10
+
+	// Default number of workers
+	defaultWorkers = 4
 )
 
-// Connect creates a new websocket client connecting to the provided endpoint.
 func Connect(ctx context.Context, rpcEndpoint string) (c *Client, err error) {
 	return ConnectWithOptions(ctx, rpcEndpoint, nil)
 }
 
-// ConnectWithOptions creates a new websocket client connecting to the provided
-// endpoint with a http header if available The http header can be helpful to
-// pass basic authentication params as prescribed
-// ref https://github.com/gorilla/websocket/issues/209
 func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (c *Client, err error) {
+	workerCount := defaultWorkers
+	if runtime.NumCPU() > 2 {
+		workerCount = runtime.NumCPU() - 1
+	}
+
 	c = &Client{
 		rpcURL:                  rpcEndpoint,
-		subscriptionByRequestID: map[uint64]*Subscription{},
-		subscriptionByWSSubID:   map[uint64]*Subscription{},
+		subscriptionByRequestID: safemap.NewSafeMap[*Subscription](),
+		subscriptionByWSSubID:   safemap.NewSafeMap[*Subscription](),
+		pong:                    completion.New(),
+		reconnectOnErr:          true,
+		workerCount:             workerCount,
+		taskChan:                make(chan messageTask, 1),
 	}
 
 	dialer := &websocket.Dialer{
 		Proxy:             http.ProxyFromEnvironment,
 		HandshakeTimeout:  DefaultHandshakeTimeout,
-		EnableCompression: true,
+		EnableCompression: false,            // Disable compression for large messages
+		ReadBufferSize:    10 * 1024 * 1024, // 10MB read buffer
+		WriteBufferSize:   1024 * 1024,      // 1MB write buffer
 	}
 
 	if opt != nil && opt.ShortID {
@@ -92,6 +141,7 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
 		httpHeader = opt.HttpHeader
 	}
+
 	var resp *http.Response
 	c.conn, resp, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
 	if err != nil {
@@ -104,31 +154,192 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		return nil, err
 	}
 
+	err = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	if err != nil {
+		return nil, fmt.Errorf("failed to set read deadline: %w", err)
+	}
+
 	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
+
+	// Start workers
+	for i := 0; i < c.workerCount; i++ {
+		go c.messageWorker()
+	}
+
+	// Start connection maintenance goroutine
+	go c.maintainConnection(c.connCtx)
+
+	// Start ping/pong handler
 	go func() {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
+		c.conn.SetPongHandler(func(string) error {
+			if c.conn == nil || c.pong == nil {
+				return nil
+			}
+
+			c.conn.SetReadDeadline(time.Now().Add(pongWait))
+			c.pong.Complete()
+			c.pong.Reset()
+			return nil
+		})
+		c.conn.SetPingHandler(func(string) error {
+			return c.sendPong()
+		})
+
 		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+
 		for {
 			select {
 			case <-c.connCtx.Done():
 				return
 			case <-ticker.C:
-				c.sendPing()
+				if err := c.sendPing(); err != nil {
+					slog.Error("failed to send ping", "err", err.Error())
+					return
+				}
 			}
 		}
 	}()
+
 	go c.receiveMessages()
 	return c, nil
 }
 
-func (c *Client) sendPing() {
+func (c *Client) messageWorker() {
+	for {
+		select {
+		case <-c.connCtx.Done():
+			return
+		case task := <-c.taskChan:
+			c.processMessage(task.buf)
+		}
+	}
+}
+
+func (c *Client) maintainConnection(ctx context.Context) {
+	backoff := time.Second
+	maxBackoff := time.Minute * 2
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			if c.conn == nil {
+				if err := c.Connect(); err != nil {
+					slog.Error("reconnection failed", "err", err.Error())
+					backoff = time.Duration(math.Min(float64(backoff*2), float64(maxBackoff)))
+					continue
+				}
+				backoff = time.Second
+				slog.Info("successfully reconnected to websocket")
+			}
+		}
+	}
+}
+
+func (c *Client) Connect() error {
+	dialer := &websocket.Dialer{
+		ReadBufferSize:    8 * 1024 * 1024,
+		WriteBufferSize:   1024 * 1024,
+		HandshakeTimeout:  DefaultHandshakeTimeout,
+		EnableCompression: false,
+	}
+
+	conn, _, err := dialer.Dial(c.rpcURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to dial websocket: %w", err)
+	}
+
+	c.conn = conn
+	return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+}
+
+func (c *Client) receiveMessages() {
+	reader := bufferPool.Get()
+	defer bufferPool.Put(reader)
+
+	for {
+		select {
+		case <-c.connCtx.Done():
+			return
+		default:
+			messageType, reader, err := c.conn.NextReader()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					slog.Error("websocket unexpected close error", "err", err.Error())
+				}
+				c.closeAllSubscription(err)
+				if c.reconnectOnErr {
+					c.conn = nil
+				}
+				return
+			}
+
+			if messageType != websocket.TextMessage {
+				continue
+			}
+
+			buf := rawMessagePool.Get().(*bytes.Buffer)
+			buf.Reset()
+
+			_, err = io.Copy(buf, reader)
+			if err != nil {
+				rawMessagePool.Put(buf)
+				continue
+			}
+
+			select {
+			case c.taskChan <- messageTask{buf: buf}:
+			default:
+				slog.Error("Worker pool is full, dropping message")
+				rawMessagePool.Put(buf)
+			}
+		}
+	}
+}
+
+func (c *Client) sendPing() error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
 	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-		return
+		return fmt.Errorf("unable to send ping: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) sendPong() error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	if err := c.conn.WriteMessage(websocket.PongMessage, []byte{}); err != nil {
+		return fmt.Errorf("unable to send pong: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Client) Ping(timeout ...time.Duration) error {
+	ch := c.pong.Done()
+
+	if err := c.sendPing(); err != nil {
+		return fmt.Errorf("unable to send ping: %w", err)
+	}
+
+	_timeout := pongWait
+	if len(timeout) > 0 {
+		_timeout = timeout[0]
+	}
+
+	select {
+	case <-ch:
+		return nil
+	case <-time.After(_timeout):
+		return fmt.Errorf("timeout waiting for pong")
 	}
 }
 
@@ -136,139 +347,90 @@ func (c *Client) Close() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	c.connCtxCancel()
-	c.conn.Close()
+	if c.conn != nil {
+		c.conn.Close()
+	}
+	close(c.taskChan)
 }
 
-func (c *Client) receiveMessages() {
-	for {
-		select {
-		case <-c.connCtx.Done():
-			return
-		default:
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				c.closeAllSubscription(err)
-				return
-			}
-			c.handleMessage(message)
-		}
-	}
-}
-
-// GetUint64 returns the value retrieved by `Get`, cast to a uint64 if possible.
-// If key data type do not match, it will return an error.
-func getUint64(data []byte, keys ...string) (val uint64, err error) {
-	v, t, _, e := jsonparser.Get(data, keys...)
-	if e != nil {
-		return 0, e
-	}
-	if t != jsonparser.Number {
-		return 0, fmt.Errorf("Value is not a number: %s", string(v))
-	}
-	return strconv.ParseUint(string(v), 10, 64)
-}
-
-func getUint64WithOk(data []byte, path ...string) (uint64, bool) {
-	val, err := getUint64(data, path...)
-	if err == nil {
-		return val, true
-	}
-	return 0, false
-}
-
-func (c *Client) handleMessage(message []byte) {
-	// when receiving message with id. the result will be a subscription number.
-	// that number will be associated to all future message destine to this request
-
-	// Check for an error in the message.
-	if errorCode, errMsg, ok := getJsonRpcError(message); ok {
-		fmt.Printf("Error received in websocket message: Code: %d, Message: %s\n", errorCode, errMsg)
-		return
-	}
-
-	// Handle message with ID: this is a subscription response.
-	requestID, ok := getUint64WithOk(message, "id")
-	if ok {
-		subID, _ := getUint64WithOk(message, "result")
-		c.handleNewSubscriptionMessage(requestID, subID)
-		return
-	}
-
-	// Handle message associated with a subscription ID.
-	subID, _ := getUint64WithOk(message, "params", "subscription")
-	c.handleSubscriptionMessage(subID, message)
-}
-
-// getJsonRpcError checks if the message contains a JSON-RPC error.
-// Returns the error code, error message, and a boolean indicating if an error was present.
-func getJsonRpcError(message []byte) (errorCode int64, errMsg string, ok bool) {
-	if val, dataType, _, err := jsonparser.Get(message, "error"); err == nil && dataType == jsonparser.Object {
-		code, _ := jsonparser.GetInt(val, "code")
-		msg, _ := jsonparser.GetString(val, "message")
-		return code, msg, true
-	}
-
-	return 0, "", false
-}
-
-func (c *Client) handleNewSubscriptionMessage(requestID, subID uint64) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
+func (c *Client) handleNewSubscriptionMessage(requestID uint64, parsed *resp) {
 	if traceEnabled {
-		zlog.Debug("received new subscription message",
-			zap.Uint64("message_id", requestID),
-			zap.Uint64("subscription_id", subID),
+		slog.Debug("received new subscription message",
+			slog.Uint64("message_id", requestID),
 		)
 	}
 
-	callBack, found := c.subscriptionByRequestID[requestID]
+	sub, found := c.subscriptionByRequestID.Get(requestID)
 	if !found {
-		zlog.Error("cannot find websocket message handler for a new stream.... this should not happen",
-			zap.Uint64("request_id", requestID),
-			zap.Uint64("subscription_id", subID),
+		slog.Error("cannot find websocket message handler for a new stream",
+			slog.Uint64("request_id", requestID),
 		)
 		return
 	}
-	callBack.subID = subID
-	c.subscriptionByWSSubID[subID] = callBack
 
-	zlog.Debug("registered ws subscription",
-		zap.Uint64("subscription_id", subID),
-		zap.Uint64("request_id", requestID),
-		zap.Int("subscription_count", len(c.subscriptionByWSSubID)),
+	if parsed.Error != nil {
+		sub.err <- parsed.Error
+		return
+	}
+
+	subID, ok := parsed.resultInt()
+	if !ok {
+		return
+	}
+
+	sub.subID = subID
+	c.subscriptionByWSSubID.Set(subID, sub)
+
+	slog.Debug("registered ws subscription",
+		slog.Uint64("subscription_id", subID),
+		slog.Uint64("request_id", requestID),
+		slog.Int("subscription_count", c.subscriptionByWSSubID.Length()),
 	)
-	return
+
+	sub.err <- nil
 }
 
-func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
+func (c *Client) handleSubscriptionMessage(subID uint64, parsed *resp) {
 	if traceEnabled {
-		zlog.Debug("received subscription message",
-			zap.Uint64("subscription_id", subID),
+		slog.Debug("received subscription message",
+			slog.Uint64("subscription_id", subID),
 		)
 	}
 
-	c.lock.RLock()
-	sub, found := c.subscriptionByWSSubID[subID]
-	c.lock.RUnlock()
+	sub, found := c.subscriptionByWSSubID.Get(subID)
 	if !found {
-		zlog.Warn("unable to find subscription for ws message", zap.Uint64("subscription_id", subID))
+		// slog.Warn("unable to find subscription for ws message, unsubscribing",
+		// 	slog.Uint64("subscription_id", subID),
+		// 	"method", parsed.Method,
+		// )
+		//
+		// method := parsed.Method
+		// method = strings.TrimSuffix(method, "Notification")
+		// method += "Unsubscribe"
+		//
+		// if err := c.unsubscribe(subID, method); err != nil {
+		// 	slog.Warn("unable to send rpc unsubscribe call",
+		// 		"err", err.Error(),
+		// 		"subscription_id", subID,
+		// 	)
+		// }
 		return
 	}
 
-	// Decode the message using the subscription-provided decoderFunc.
-	result, err := sub.decoderFunc(message)
+	if parsed.Error != nil {
+		sub.err <- parsed.Error
+		return
+	}
+
+	result, err := sub.decoderFunc(parsed.Params.Result)
 	if err != nil {
-		fmt.Println("*****************************")
 		c.closeSubscription(sub.req.ID, fmt.Errorf("unable to decode client response: %w", err))
 		return
 	}
 
-	// this cannot be blocking or else
-	// we  will no read any other message
 	if len(sub.stream) >= cap(sub.stream) {
-		zlog.Warn("closing ws client subscription... not consuming fast en ought",
-			zap.Uint64("request_id", sub.req.ID),
+		slog.Warn("closing ws client subscription... not consuming fast enough",
+			slog.Uint64("request_id", sub.req.ID),
 		)
 		c.closeSubscription(sub.req.ID, fmt.Errorf("reached channel max capacity %d", len(sub.stream)))
 		return
@@ -277,26 +439,19 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	if !sub.closed {
 		sub.stream <- result
 	}
-	return
 }
 
 func (c *Client) closeAllSubscription(err error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	for _, sub := range c.subscriptionByRequestID {
+	for _, sub := range c.subscriptionByRequestID.GetAll() {
 		sub.err <- err
 	}
 
-	c.subscriptionByRequestID = map[uint64]*Subscription{}
-	c.subscriptionByWSSubID = map[uint64]*Subscription{}
+	c.subscriptionByRequestID = safemap.NewSafeMap[*Subscription]()
+	c.subscriptionByWSSubID = safemap.NewSafeMap[*Subscription]()
 }
 
 func (c *Client) closeSubscription(reqID uint64, err error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	sub, found := c.subscriptionByRequestID[reqID]
+	sub, found := c.subscriptionByRequestID.Get(reqID)
 	if !found {
 		return
 	}
@@ -305,13 +460,15 @@ func (c *Client) closeSubscription(reqID uint64, err error) {
 
 	err = c.unsubscribe(sub.subID, sub.unsubscribeMethod)
 	if err != nil {
-		zlog.Warn("unable to send rpc unsubscribe call",
-			zap.Error(err),
+		slog.Warn("unable to send rpc unsubscribe call",
+			"err", err.Error(),
+			"subscription_id", sub.subID,
+			"request_id", reqID,
 		)
 	}
 
-	delete(c.subscriptionByRequestID, sub.req.ID)
-	delete(c.subscriptionByWSSubID, sub.subID)
+	c.subscriptionByRequestID.Delete(reqID)
+	c.subscriptionByWSSubID.Delete(sub.subID)
 }
 
 func (c *Client) unsubscribe(subID uint64, method string) error {
@@ -336,13 +493,10 @@ func (c *Client) subscribe(
 	unsubscribeMethod string,
 	decoderFunc decoderFunc,
 ) (*Subscription, error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	req := newRequest(params, subscriptionMethod, conf, c.shortID)
 	data, err := req.encode()
 	if err != nil {
-		return nil, fmt.Errorf("subscribe: unable to encode subsciption request: %w", err)
+		return nil, fmt.Errorf("subscribe: unable to encode subscription request: %w", err)
 	}
 
 	sub := newSubscription(
@@ -354,64 +508,74 @@ func (c *Client) subscribe(
 		decoderFunc,
 	)
 
-	c.subscriptionByRequestID[req.ID] = sub
-	zlog.Info("added new subscription to websocket client", zap.Int("count", len(c.subscriptionByRequestID)))
+	c.subscriptionByRequestID.Set(req.ID, sub)
 
-	zlog.Debug("writing data to conn", zap.String("data", string(data)))
+	slog.Info("added new subscription to websocket client", slog.Int("count", c.subscriptionByRequestID.Length()))
+	slog.Debug("writing data to conn",
+		slog.Any("data", jjson.RawMessage(data)),
+	)
+
 	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	err = c.conn.WriteMessage(websocket.TextMessage, data)
-	if err != nil {
-		delete(c.subscriptionByRequestID, req.ID)
-		return nil, fmt.Errorf("unable to write request: %w", err)
+	if err = c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		c.subscriptionByRequestID.Delete(req.ID)
+		return nil, fmt.Errorf("unable to write subscription request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	if _, err := sub.Recv(ctx); err != nil {
+		c.subscriptionByRequestID.Delete(req.ID)
+		return nil, fmt.Errorf("unable to connect: %w", err)
 	}
 
 	return sub, nil
 }
 
+// Update processMessage function to use Sonic
+func (c *Client) processMessage(buf *bytes.Buffer) {
+	defer rawMessagePool.Put(buf)
+
+	// Get message struct from pool
+	parsed := messageTypePool.Get().(*resp)
+	defer messageTypePool.Put(parsed)
+
+	messageBytes := buf.Bytes()
+
+	dec := sonicAPI.NewDecoder(bytes.NewReader(messageBytes))
+	dec.UseNumber()
+	if err := dec.Decode(parsed); err != nil {
+		slog.Error("failed to decode message",
+			"err", err.Error(),
+			"msg_size", buf.Len(),
+			"msg_content", buf.String()[:min(100, buf.Len())],
+		)
+		return
+	}
+
+	// Make a copy of the message for handlers
+	if parsed.ID != "" {
+		requestID, _ := strconv.ParseUint(parsed.ID.String(), 10, 64)
+		c.handleNewSubscriptionMessage(requestID, parsed)
+		return
+	}
+
+	if parsed.Params != nil {
+		subID, _ := strconv.ParseUint(parsed.Params.Subscription.String(), 10, 64)
+		c.handleSubscriptionMessage(subID, parsed)
+		return
+	}
+}
+
+// Update any other JSON handling functions
 func decodeResponseFromReader(r io.Reader, reply interface{}) (err error) {
-	var c *response
-	if err := json.NewDecoder(r).Decode(&c); err != nil {
-		return err
-	}
-
-	if c.Error != nil {
-		jsonErr := &json2.Error{}
-		if err := json.Unmarshal(*c.Error, jsonErr); err != nil {
-			return &json2.Error{
-				Code:    json2.E_SERVER,
-				Message: string(*c.Error),
-			}
-		}
-		return jsonErr
-	}
-
-	if c.Params == nil {
-		return json2.ErrNullResult
-	}
-
-	return json.Unmarshal(*c.Params.Result, &reply)
+	return sonicAPI.NewDecoder(r).Decode(reply)
 }
 
 func decodeResponseFromMessage(r []byte, reply interface{}) (err error) {
-	var c *response
-	if err := json.Unmarshal(r, &c); err != nil {
-		return err
+	if len(r) == 0 {
+		return fmt.Errorf("empty message in decodeResponseFromMessage")
 	}
 
-	if c.Error != nil {
-		jsonErr := &json2.Error{}
-		if err := json.Unmarshal(*c.Error, jsonErr); err != nil {
-			return &json2.Error{
-				Code:    json2.E_SERVER,
-				Message: string(*c.Error),
-			}
-		}
-		return jsonErr
-	}
-
-	if c.Params == nil {
-		return json2.ErrNullResult
-	}
-
-	return json.Unmarshal(*c.Params.Result, &reply)
+	return sonicAPI.Unmarshal(r, reply)
 }

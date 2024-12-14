@@ -226,7 +226,8 @@ var spewConf = spew.ConfigState{
 
 // Error function is provided to be used as error object.
 func (e *RPCError) Error() string {
-	return spewConf.Sdump(e)
+	// return spewConf.Sdump(e)
+	return fmt.Sprintf("%s (%d)", e.Message, e.Code)
 }
 
 // HTTPError represents a error that occurred on HTTP level.

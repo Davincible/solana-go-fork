@@ -17,7 +17,10 @@
 
 package ws
 
-import "context"
+import (
+	"context"
+	"sync"
+)
 
 type Subscription struct {
 	req               *request
@@ -28,6 +31,7 @@ type Subscription struct {
 	closed            bool
 	unsubscribeMethod string
 	decoderFunc       decoderFunc
+	closeOnce         sync.Once
 }
 
 type decoderFunc func([]byte) (interface{}, error)
@@ -65,8 +69,10 @@ func (s *Subscription) Unsubscribe() {
 }
 
 func (s *Subscription) unsubscribe(err error) {
-	s.closeFunc(err)
-	s.closed = true
-	close(s.stream)
-	close(s.err)
+	s.closeOnce.Do(func() {
+		s.closeFunc(err)
+		s.closed = true
+		close(s.stream)
+		close(s.err)
+	})
 }

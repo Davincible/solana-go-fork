@@ -18,11 +18,14 @@
 package ws
 
 import (
+	"encoding/json"
 	stdjson "encoding/json"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"time"
+
+	"github.com/gagliardetto/solana-go/rpc/jsonrpc"
 )
 
 type request struct {
@@ -32,16 +35,39 @@ type request struct {
 	ID      uint64      `json:"id"`
 }
 
+type resp struct {
+	ID     json.Number       `json:"id,omitempty"`
+	Method string            `json:"method,omitempty"`
+	Result json.RawMessage   `json:"result,omitempty"`
+	Error  *jsonrpc.RPCError `json:"error,omitempty"`
+	Params *subParams        `json:"params,omitempty"`
+}
+
+type subParams struct {
+	Subscription json.Number `json:"subscription,omitempty"`
+	Result       json.RawMessage
+}
+
+func (r *resp) resultInt() (uint64, bool) {
+	if r.Result == nil {
+		return 0, false
+	}
+
+	var res uint64
+	if err := sonicAPI.Unmarshal(r.Result, &res); err != nil {
+		return 0, false
+	}
+
+	return res, true
+}
+
 func newRequest(params []interface{}, method string, configuration map[string]interface{}, shortID bool) *request {
 	if params != nil && configuration != nil {
 		params = append(params, configuration)
 	}
-	var ID uint64
-	if !shortID {
-		ID = uint64(rand.Int63())
-	} else {
-		ID = uint64(rand.Int31())
-	}
+
+	ID := uint64(rand.Int31())
+
 	return &request{
 		Version: "2.0",
 		Method:  method,
@@ -51,7 +77,7 @@ func newRequest(params []interface{}, method string, configuration map[string]in
 }
 
 func (c *request) encode() ([]byte, error) {
-	data, err := json.Marshal(c)
+	data, err := jsonn.Marshal(c)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: json marshall: %w", err)
 	}

@@ -14,9 +14,6 @@
 
 package ws
 
-import (
-	// stdjson "encoding/json"
-	jsoniter "github.com/json-iterator/go"
-)
+// stdjson "encoding/json"
 
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
+// var json = jsoniter.ConfigCompatibleWithStandardLibrary

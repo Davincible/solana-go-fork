@@ -76,7 +76,10 @@ func (cl *Client) GetBlock(
 	return cl.GetBlockWithOpts(
 		ctx,
 		slot,
-		nil,
+		&GetBlockOpts{
+			TransactionDetails:             TransactionDetailsFull,
+			MaxSupportedTransactionVersion: &MaxSupportedTransactionVersion0,
+		},
 	)
 }
 

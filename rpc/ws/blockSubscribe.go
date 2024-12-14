@@ -124,7 +124,7 @@ func (c *Client) BlockSubscribe(
 			obj["rewards"] = opts.Rewards
 		}
 		obj["maxSupportedTransactionVersion"] = 0
-		// obj["transactionDetails"] = "full"
+
 		if len(obj) > 0 {
 			params = append(params, obj)
 		}
